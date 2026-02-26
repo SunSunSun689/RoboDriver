@@ -10,7 +10,12 @@ import rospy
 from sensor_msgs.msg import JointState, Image
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from geometry_msgs.msg import PoseStamped
-from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import robotHandPosition, robotHeadMotionData, sensorsData
+try:
+    # 优先使用ROS原生消息包，确保与rostopic type一致（kuavo_msgs/*）
+    from kuavo_msgs.msg import robotHandPosition, robotHeadMotionData, sensorsData
+except Exception:
+    # 兼容旧SDK导入路径
+    from kuavo_humanoid_sdk.msg.kuavo_msgs.msg import robotHandPosition, robotHeadMotionData, sensorsData
 # 禁用kuavo-humanoid-sdk的日志记录，避免连接ws://localhost:8889失败
 
 
@@ -23,6 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT_FRAME = 10
+MAX_SYNC_ERROR_SEC = 0.01
 
 
 class LEJUKuavoRos1Node:
@@ -58,6 +64,12 @@ class LEJUKuavoRos1Node:
         self.recv_follower: Dict[str, np.ndarray] = {}
         self.recv_images_status: Dict[str, int] = {}
         self.recv_follower_status: Dict[str, int] = {}
+        self.latest_body_msg = None
+        self.latest_hand_msg = None
+        self.body_msg_count = 0
+        self.hand_msg_count = 0
+        self._warned_headerless_follow = False
+        self._warned_headerless_image = False
 
         rospy.loginfo("初始化消息过滤器...")
         self._init_message_follow_filters()
@@ -65,76 +77,149 @@ class LEJUKuavoRos1Node:
         rospy.loginfo("节点初始化完成，等待话题消息...")
 
     def _init_message_follow_filters(self):
-
         sub_body = Subscriber('/sensors_data_raw', sensorsData)
         sub_hand = Subscriber('/dexhand/state', JointState)
-        
-        self.sync = ApproximateTimeSynchronizer(
+
+        self.follow_sync = ApproximateTimeSynchronizer(
             [sub_body, sub_hand],
-            queue_size=10,
-            slop=0.1  # 增大 slop 提高同步成功率
+            queue_size=50,
+            slop=MAX_SYNC_ERROR_SEC,
+            allow_headerless=True,
         )
-        self.sync.registerCallback(self.synchronized_follow_callback)
+        self.follow_sync.registerCallback(self.synchronized_follow_callback)
+        rospy.loginfo(
+            f"已启用从臂话题同步: /sensors_data_raw + /dexhand/state, 最大时间误差={MAX_SYNC_ERROR_SEC:.3f}s"
+        )
+
+    def _get_msg_stamp_sec(self, msg):
+        header = getattr(msg, 'header', None)
+        stamp = getattr(header, 'stamp', None)
+        if stamp is None:
+            return None
+        try:
+            return stamp.to_sec()
+        except Exception:
+            return None
+
+    def _process_body_msg(self, body_msg):
+        try:
+            joint_data = getattr(body_msg, "joint_data", None)
+            if joint_data is None:
+                return
+
+            if hasattr(joint_data, "position"):
+                body_pos = joint_data.position
+            elif hasattr(joint_data, "joint_q"):
+                body_pos = joint_data.joint_q
+            else:
+                return
+
+            if len(body_pos) < 26:
+                rospy.logwarn(f"Body joint data too short for arms: {len(body_pos)}")
+                return
+
+            left_arm = np.array(body_pos[12:19], dtype=np.float32)
+            right_arm = np.array(body_pos[19:26], dtype=np.float32)
+            if len(body_pos) >= 28:
+                head = np.array(body_pos[26:28], dtype=np.float32)
+            else:
+                head = np.zeros(2, dtype=np.float32)
+
+            with self.lock:
+                self.recv_follower['right_arm'] = right_arm
+                self.recv_follower['left_arm'] = left_arm
+                self.recv_follower['head'] = head
+                self.recv_follower_status['right_arm'] = CONNECT_TIMEOUT_FRAME
+                self.recv_follower_status['left_arm'] = CONNECT_TIMEOUT_FRAME
+                self.recv_follower_status['head'] = CONNECT_TIMEOUT_FRAME
+        except Exception as e:
+            rospy.logwarn(f"_process_body_msg error: {e}")
+
+    def _process_hand_msg(self, hand_msg):
+        try:
+            hand_pos = list(getattr(hand_msg, "position", []))
+            if len(hand_pos) < 12:
+                rospy.logwarn(f"Hand position length < 12: {len(hand_pos)}")
+                hand_pos = hand_pos + [0.0] * (12 - len(hand_pos))
+
+            left_dexhand = np.array(hand_pos[0:6], dtype=np.float32)
+            right_dexhand = np.array(hand_pos[6:12], dtype=np.float32)
+
+            with self.lock:
+                self.recv_follower['right_dexhand'] = right_dexhand
+                self.recv_follower['left_dexhand'] = left_dexhand
+                self.recv_follower_status['right_dexhand'] = CONNECT_TIMEOUT_FRAME
+                self.recv_follower_status['left_dexhand'] = CONNECT_TIMEOUT_FRAME
+        except Exception as e:
+            rospy.logwarn(f"_process_hand_msg error: {e}")
 
     def synchronized_follow_callback(self, body_msg, hand_msg):
         try:
+            self.body_msg_count += 1
+            self.hand_msg_count += 1
+            if self.body_msg_count == 1:
+                rospy.loginfo("首次收到 /sensors_data_raw")
+            if self.hand_msg_count == 1:
+                rospy.loginfo("首次收到 /dexhand/state")
+
+            body_stamp = self._get_msg_stamp_sec(body_msg)
+            hand_stamp = self._get_msg_stamp_sec(hand_msg)
+            if body_stamp is not None and hand_stamp is not None:
+                sync_error = abs(body_stamp - hand_stamp)
+                if sync_error > MAX_SYNC_ERROR_SEC:
+                    rospy.logwarn_throttle(
+                        1.0,
+                        f"从臂话题时间误差超限: {sync_error:.6f}s > {MAX_SYNC_ERROR_SEC:.3f}s"
+                    )
+                    return
+            elif not self._warned_headerless_follow:
+                rospy.logwarn("从臂话题缺少header.stamp，已使用接收时间近似同步，无法严格保证0.01s时间误差")
+                self._warned_headerless_follow = True
+
+            joint_data = getattr(body_msg, "joint_data", None)
+            if joint_data is None:
+                rospy.logwarn("body_msg 中不存在 joint_data 字段")
+                return
+
+            # 兼容不同消息定义：position 或 joint_q
+            if hasattr(joint_data, "position"):
+                body_pos = joint_data.position
+            elif hasattr(joint_data, "joint_q"):
+                body_pos = joint_data.joint_q
+            else:
+                rospy.logwarn("joint_data 不包含 position/joint_q 字段")
+                return
+
             # 打印接收到的消息信息
-            rospy.loginfo(f"Received follow data: body_msg joints={len(body_msg.joint_data.position)}, hand_msg positions={len(hand_msg.position)}")
+            #rospy.loginfo(f"Received follow data: body_msg joints={len(body_pos)}, hand_msg positions={len(hand_msg.position)}")
             
             # 检测话题数据
-            if len(body_msg.joint_data.position) > 0:
+            if len(body_pos) > 0:
                 # 打印前几个关节位置作为示例
-                sample_positions = body_msg.joint_data.position[:5] if len(body_msg.joint_data.position) >= 5 else body_msg.joint_data.position
-                rospy.loginfo(f"Body joint sample positions: {sample_positions}")
+                sample_positions = body_pos[:5] if len(body_pos) >= 5 else body_pos
+                #rospy.loginfo(f"Body joint sample positions: {sample_positions}")
                 
                 # 检测数据范围
-                for i, pos in enumerate(body_msg.joint_data.position):
+                for i, pos in enumerate(body_pos):
                     if abs(pos) > 1000:  # 假设关节位置不应该超过1000
                         rospy.logwarn(f"Joint {i} position out of range: {pos}")
             
             if len(hand_msg.position) > 0:
                 sample_hand = hand_msg.position[:3] if len(hand_msg.position) >= 3 else hand_msg.position
-                rospy.loginfo(f"Hand position sample: {sample_hand}")
+                #rospy.loginfo(f"Hand position sample: {sample_hand}")
                 
                 # 检测手部数据范围
                 for i, pos in enumerate(hand_msg.position):
                     if pos < 0 or pos > 100:  # 假设手部位置在0-100范围内
                         rospy.logwarn(f"Hand position {i} out of range [0,100]: {pos}")
             
+            # 独立更新，避免双话题严格同步导致无数据
+            self._process_body_msg(body_msg)
+            self._process_hand_msg(hand_msg)
+
             current_time_ns = time.time_ns()
-            if (current_time_ns - self.last_follow_send_time_ns) < self.min_interval_ns:
-                return
-            self.last_follow_send_time_ns = current_time_ns
-
-        
-            pos = body_msg.joint_data.position
-            if len(pos) < 28:
-                rospy.logwarn(f"Body joint data too short: {len(pos)}")
-                return
-
-            left_arm = np.array(pos[12:19], dtype=np.float32)   # 7
-            right_arm = np.array(pos[19:26], dtype=np.float32)  # 7
-            head = np.array(pos[26:28], dtype=np.float32)       # 2
-
- 
-            if len(hand_msg.position) != 12:
-                rospy.logwarn(f"Hand position length != 12: {len(hand_msg.position)}")
-                return
-            left_dexhand = np.array(hand_msg.position[0:6], dtype=np.float32)   # 6
-            right_dexhand = np.array(hand_msg.position[6:12], dtype=np.float32) # 6
-
-
-            with self.lock:
-                self.recv_follower['right_arm'] = right_arm
-                self.recv_follower['left_arm'] = left_arm
-                self.recv_follower['head'] = head
-                self.recv_follower['right_dexhand'] = right_dexhand
-                self.recv_follower['left_dexhand'] = left_dexhand
-                self.recv_follower_status['right_arm'] = CONNECT_TIMEOUT_FRAME
-                self.recv_follower_status['left_arm'] = CONNECT_TIMEOUT_FRAME
-                self.recv_follower_status['head'] = CONNECT_TIMEOUT_FRAME
-                self.recv_follower_status['right_dexhand'] = CONNECT_TIMEOUT_FRAME
-                self.recv_follower_status['left_dexhand'] = CONNECT_TIMEOUT_FRAME
+            if (current_time_ns - self.last_follow_send_time_ns) >= self.min_interval_ns:
+                self.last_follow_send_time_ns = current_time_ns
         except Exception as e:
             rospy.logerr(f"Synchronized follow callback error: {e}")
 
@@ -146,21 +231,38 @@ class LEJUKuavoRos1Node:
         self.image_sync = ApproximateTimeSynchronizer(
             [sub_camera_top, sub_camera_wrist_left, sub_camera_wrist_right],
             queue_size=10,
-            slop=0.1
+            slop=MAX_SYNC_ERROR_SEC,
+            allow_headerless=True,
         )
         self.image_sync.registerCallback(self.image_synchronized_callback)
 
     def image_synchronized_callback(self, top, wrist_left, wrist_right):
         try:
+            top_stamp = self._get_msg_stamp_sec(top)
+            left_stamp = self._get_msg_stamp_sec(wrist_left)
+            right_stamp = self._get_msg_stamp_sec(wrist_right)
+            stamps = [s for s in [top_stamp, left_stamp, right_stamp] if s is not None]
+            if len(stamps) == 3:
+                sync_error = max(stamps) - min(stamps)
+                if sync_error > MAX_SYNC_ERROR_SEC:
+                    rospy.logwarn_throttle(
+                        1.0,
+                        f"图像话题时间误差超限: {sync_error:.6f}s > {MAX_SYNC_ERROR_SEC:.3f}s"
+                    )
+                    return
+            elif not self._warned_headerless_image:
+                rospy.logwarn("图像话题缺少header.stamp，已使用接收时间近似同步，无法严格保证0.01s时间误差")
+                self._warned_headerless_image = True
+
             # 打印接收到的图像消息信息
-            rospy.loginfo(f"Received synchronized images: top={top.header.seq if top.header.seq else 'N/A'}, "
-                         f"wrist_left={wrist_left.header.seq if wrist_left.header.seq else 'N/A'}, "
-                         f"wrist_right={wrist_right.header.seq if wrist_right.header.seq else 'N/A'}")
+            #rospy.loginfo(f"Received synchronized images: top={top.header.seq if top.header.seq else 'N/A'}, "
+                         #f"wrist_left={wrist_left.header.seq if wrist_left.header.seq else 'N/A'}, "
+                         #f"wrist_right={wrist_right.header.seq if wrist_right.header.seq else 'N/A'}")
             
             # 检测图像数据
-            rospy.loginfo(f"Image data sizes: top={len(top.data)} bytes, "
-                         f"wrist_left={len(wrist_left.data)} bytes, "
-                         f"wrist_right={len(wrist_right.data)} bytes")
+            #rospy.loginfo(f"Image data sizes: top={len(top.data)} bytes, "
+                         #f"wrist_left={len(wrist_left.data)} bytes, "
+                         #f"wrist_right={len(wrist_right.data)} bytes")
             
             # 检查图像数据是否为空
             if len(top.data) == 0:
@@ -170,7 +272,7 @@ class LEJUKuavoRos1Node:
             if len(wrist_right.data) == 0:
                 rospy.logwarn("Right wrist camera image data is empty!")
             
-            self.images_recv(top, "image_top", 848, 480)
+            self.images_recv(top, "image_top", 424, 240)
             self.images_recv(wrist_left, "image_wrist_left", 848, 480)
             self.images_recv(wrist_right, "image_wrist_right", 848, 480)
         except Exception as e:
@@ -178,17 +280,10 @@ class LEJUKuavoRos1Node:
     
     def images_recv(self, msg, event_id, width, height, encoding="jpeg"):
         try:
-            # 打印图像消息信息
-            rospy.loginfo(f"Processing image: event_id={event_id}, encoding={msg.encoding}, "
-                         f"width={msg.width}, height={msg.height}, data_size={len(msg.data)} bytes")
+           
             
-            # 检测图像消息参数
-            if msg.width != width or msg.height != height:
-                rospy.logwarn(f"Image dimensions mismatch: expected {width}x{height}, got {msg.width}x{msg.height}")
             
-            if len(msg.data) == 0:
-                rospy.logwarn(f"Image data is empty for {event_id}")
-                return
+           
             
             if 'image' in event_id:
                 img_array = np.frombuffer(msg.data, dtype=np.uint8)
@@ -222,12 +317,12 @@ class LEJUKuavoRos1Node:
                 
                 if frame is not None:
                     # 打印图像处理结果
-                    rospy.loginfo(f"Successfully decoded image {event_id}: shape={frame.shape}, dtype={frame.dtype}")
+                    #rospy.loginfo(f"Successfully decoded image {event_id}: shape={frame.shape}, dtype={frame.dtype}")
                     
                     # 检测图像质量
                     if frame.size > 0:
                         mean_val = np.mean(frame)
-                        rospy.loginfo(f"Image {event_id} mean pixel value: {mean_val:.2f}")
+                        #rospy.loginfo(f"Image {event_id} mean pixel value: {mean_val:.2f}")
                         
                         # 检查图像是否全黑或全白
                         if mean_val < 10:
@@ -253,12 +348,32 @@ class LEJUKuavoRos1Node:
                     return 0.0
                 return round(val, decimals)
 
-            # ✅ 修正切片：按 7+6+7+6+2 = 28 维解析
-            left_arm = [normalize_precision(v) for v in array[0:7]]        # 7
-            left_dexhand = [normalize_precision(v) for v in array[7:13]]   # 6
-            right_arm = [normalize_precision(v) for v in array[13:20]]     # 7
-            right_dexhand = [normalize_precision(v) for v in array[20:26]] # 6
-            head = [normalize_precision(v) for v in array[26:28]]          # 2
+            def to_uint_list(values, vmin=0, vmax=100):
+                out = []
+                for v in values:
+                    fv = normalize_precision(v)
+                    fv = max(vmin, min(vmax, fv))
+                    out.append(int(round(fv)))
+                return out
+
+            # 兼容两种动作格式：
+            # 21维: 7(arm) + 6(right_hand) + 6(left_hand) + 2(head)
+            # 28维: 7(left_arm) + 6(left_hand) + 7(right_arm) + 6(right_hand) + 2(head)
+            if len(array) >= 28:
+                left_arm = [normalize_precision(v) for v in array[0:7]]
+                left_dexhand = to_uint_list(array[7:13])
+                right_arm = [normalize_precision(v) for v in array[13:20]]
+                right_dexhand = to_uint_list(array[20:26])
+                head = [normalize_precision(v) for v in array[26:28]]
+            elif len(array) >= 21:
+                arm = [normalize_precision(v) for v in array[0:7]]
+                right_dexhand = to_uint_list(array[7:13])
+                left_dexhand = to_uint_list(array[13:19])
+                head = [normalize_precision(v) for v in array[19:21]]
+                left_arm = arm
+                right_arm = arm
+            else:
+                raise ValueError(f"Action vector too short: {len(array)}")
 
             # --- 手臂控制 ---
             arm_msg = JointState()

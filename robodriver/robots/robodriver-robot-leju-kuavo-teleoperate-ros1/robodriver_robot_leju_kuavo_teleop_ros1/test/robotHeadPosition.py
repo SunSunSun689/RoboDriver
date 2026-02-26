@@ -1,5 +1,5 @@
 import rospy
-from kuavo_msgs.msg import robotHeadMotionData
+
 
 # 初始化ROS节点
 rospy.init_node('robot_head_controller')

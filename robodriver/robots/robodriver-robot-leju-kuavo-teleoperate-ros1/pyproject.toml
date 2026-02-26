@@ -14,9 +14,10 @@ authors = [
 keywords = ["robotics", "lerobot", "LEJU"]
 dependencies = [
 
-    "logging_mp",
+    "logging_mp==0.1.6",
     "opencv-python",
-    "kuavo-humanoid-sdk“
+    "rospkg",
+    "kuavo-humanoid-sdk"
 ]
 
 [tool.setuptools.packages.find]

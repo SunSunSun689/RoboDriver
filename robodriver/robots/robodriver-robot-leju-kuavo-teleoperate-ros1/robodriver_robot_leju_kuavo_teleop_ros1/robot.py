@@ -59,14 +59,23 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
 
         self.connected = False
         self.logs = {}
+        self._last_valid_follower: dict[str, np.ndarray] = {}
+        self.required_follower_keys = ["right_arm", "left_arm", "head"]
 
     @property
     def _follower_motors_ft(self) -> dict[str, type]:
-        return {
-            f"follower_{joint_name}.pos": float
-            for comp_name, joints in self.follower_motors.items()
-            for joint_name in joints.keys()
-        }
+        features: dict[str, type] = {}
+        for i in range(7):
+            features[f"follower_left_joint_{i}.pos"] = float
+        for n in ["l_thumb", "l_thumb_aux", "l_index", "l_middle", "l_ring", "l_pinky"]:
+            features[f"follower_{n}.pos"] = float
+        for i in range(7):
+            features[f"follower_right_joint_{i}.pos"] = float
+        for n in ["r_thumb", "r_thumb_aux", "r_index", "r_middle", "r_ring", "r_pinky"]:
+            features[f"follower_{n}.pos"] = float
+        features["follower_head_yaw.pos"] = float
+        features["follower_head_pitch.pos"] = float
+        return features
     
 
 
@@ -107,9 +116,9 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
         "等待摄像头图像超时",
     ),
     (
-        # 从臂：只要 recv_follower 字典非空就算成功
-        lambda: len(self.robot_ros1_node.recv_follower) > 0,
-        lambda: [] if len(self.robot_ros1_node.recv_follower) == 0 else [],
+        # 从臂：至少需要双臂+头部到位，避免仅手部数据导致误判成功
+        lambda: all(k in self.robot_ros1_node.recv_follower for k in self.required_follower_keys),
+        lambda: [k for k in self.required_follower_keys if k not in self.robot_ros1_node.recv_follower],
         "等待从臂关节角度超时",
     ),
         ]      
@@ -168,7 +177,9 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
                     break
 
                 raise TimeoutError(
-                    f"连接超时，未满足的条件: {'; '.join(failed_messages)}"
+                    f"连接超时，未满足的条件: {'; '.join(failed_messages)}; "
+                    f"从臂回调计数 body={getattr(self.robot_ros1_node, 'body_msg_count', 0)}, "
+                    f"hand={getattr(self.robot_ros1_node, 'hand_msg_count', 0)}"
                 )
 
             # 减少 CPU 占用
@@ -188,11 +199,15 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
 
         if conditions[1][0]():
             follower_received = [
-                name
-                for name in self.follower_motors
-                if any(name in key for key in self.robot_ros1_node.recv_follower)
+                name for name in self.required_follower_keys
+                if name in self.robot_ros1_node.recv_follower
             ]
             success_messages.append(f"从臂数据: {', '.join(follower_received)}")
+        else:
+            success_messages.append(
+                f"从臂回调计数: body={getattr(self.robot_ros1_node, 'body_msg_count', 0)}, "
+                f"hand={getattr(self.robot_ros1_node, 'hand_msg_count', 0)}"
+            )
 
         log_message = "\n[连接成功] 所有设备已就绪:\n"
         log_message += "\n".join(f"  - {msg}" for msg in success_messages)
@@ -234,12 +249,35 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
 
         start = time.perf_counter()
         obs_dict: dict[str, Any] = {}
-        # 读取从臂数据（替换ROS2节点为ROS1节点）
-        for comp_name, joints in self.follower_motors.items():
-            for follower_name, follower in self.robot_ros1_node.recv_follower.items():
-                if follower_name == comp_name:
-                    for i, joint_name in enumerate(joints.keys()):
-                        obs_dict[f"follower_{joint_name}.pos"] = float(follower[i])
+        if self.robot_ros1_node.recv_follower:
+            self._last_valid_follower = {
+                k: np.array(v, dtype=np.float32)
+                for k, v in self.robot_ros1_node.recv_follower.items()
+            }
+        follower_source = self._last_valid_follower if self._last_valid_follower else self.robot_ros1_node.recv_follower
+
+        # 读取从臂数据（28维：左臂7 + 左手6 + 右臂7 + 右手6 + 头2）
+        left_arm = follower_source.get("left_arm", np.zeros(7, dtype=np.float32))
+        for i in range(7):
+            obs_dict[f"follower_left_joint_{i}.pos"] = float(left_arm[i]) if i < len(left_arm) else 0.0
+
+        left_hand = follower_source.get("left_dexhand", np.zeros(6, dtype=np.float32))
+        left_names = ["l_thumb", "l_thumb_aux", "l_index", "l_middle", "l_ring", "l_pinky"]
+        for i, name in enumerate(left_names):
+            obs_dict[f"follower_{name}.pos"] = float(left_hand[i]) if i < len(left_hand) else 0.0
+
+        right_arm = follower_source.get("right_arm", np.zeros(7, dtype=np.float32))
+        for i in range(7):
+            obs_dict[f"follower_right_joint_{i}.pos"] = float(right_arm[i]) if i < len(right_arm) else 0.0
+
+        right_hand = follower_source.get("right_dexhand", np.zeros(6, dtype=np.float32))
+        right_names = ["r_thumb", "r_thumb_aux", "r_index", "r_middle", "r_ring", "r_pinky"]
+        for i, name in enumerate(right_names):
+            obs_dict[f"follower_{name}.pos"] = float(right_hand[i]) if i < len(right_hand) else 0.0
+
+        head = follower_source.get("head", np.zeros(2, dtype=np.float32))
+        obs_dict["follower_head_yaw.pos"] = float(head[0]) if len(head) > 0 else 0.0
+        obs_dict["follower_head_pitch.pos"] = float(head[1]) if len(head) > 1 else 0.0
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read follower state: {dt_ms:.1f} ms")
@@ -262,16 +300,35 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
 
         start = time.perf_counter()
         act_dict: dict[str, Any] = {}
-         # 读取从臂关节位置
-        for comp_name, joints in self.follower_motors.items():
-            for follower_name, follower in self.robot_ros1_node.recv_follower.items():
-                if follower_name == comp_name:
-                    joint_keys = list(joints.keys())
-                    # 防御长度不匹配，避免索引越界
-                    num_joints = min(len(joint_keys), len(follower))
-                    for i in range(num_joints):
-                        joint_name = joint_keys[i]
-                        act_dict[f"follower_{joint_name}.pos"] = float(follower[i])
+        if self.robot_ros1_node.recv_follower:
+            self._last_valid_follower = {
+                k: np.array(v, dtype=np.float32)
+                for k, v in self.robot_ros1_node.recv_follower.items()
+            }
+        follower_source = self._last_valid_follower if self._last_valid_follower else self.robot_ros1_node.recv_follower
+
+        # 读取从臂关节位置（28维：左臂7 + 左手6 + 右臂7 + 右手6 + 头2）
+        left_arm = follower_source.get("left_arm", np.zeros(7, dtype=np.float32))
+        for i in range(7):
+            act_dict[f"follower_left_joint_{i}.pos"] = float(left_arm[i]) if i < len(left_arm) else 0.0
+
+        left_hand = follower_source.get("left_dexhand", np.zeros(6, dtype=np.float32))
+        left_names = ["l_thumb", "l_thumb_aux", "l_index", "l_middle", "l_ring", "l_pinky"]
+        for i, name in enumerate(left_names):
+            act_dict[f"follower_{name}.pos"] = float(left_hand[i]) if i < len(left_hand) else 0.0
+
+        right_arm = follower_source.get("right_arm", np.zeros(7, dtype=np.float32))
+        for i in range(7):
+            act_dict[f"follower_right_joint_{i}.pos"] = float(right_arm[i]) if i < len(right_arm) else 0.0
+
+        right_hand = follower_source.get("right_dexhand", np.zeros(6, dtype=np.float32))
+        right_names = ["r_thumb", "r_thumb_aux", "r_index", "r_middle", "r_ring", "r_pinky"]
+        for i, name in enumerate(right_names):
+            act_dict[f"follower_{name}.pos"] = float(right_hand[i]) if i < len(right_hand) else 0.0
+
+        head = follower_source.get("head", np.zeros(2, dtype=np.float32))
+        act_dict["follower_head_yaw.pos"] = float(head[0]) if len(head) > 0 else 0.0
+        act_dict["follower_head_pitch.pos"] = float(head[1]) if len(head) > 1 else 0.0
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read follower state: {dt_ms:.1f} ms")
@@ -297,13 +354,47 @@ class LEJUKuavoRos1Robot(Robot):  # 类名改为ROS1标识
             raise DeviceNotConnectedError(
                 "LEJUKuavo is not connected. You need to run `robot.connect()`."
             )
-        goal_joint = [val for key, val in action.items()]
-        # goal_joint_numpy = np.array([t.item() for t in goal_joint], dtype=np.float32)
-        goal_joint_numpy = np.array([t for t in goal_joint], dtype=np.float32)
-        goal_joint_numpy = goal_joint_numpy[:16]
+        expected_action_keys = [
+            "follower_left_joint_0.pos",
+            "follower_left_joint_1.pos",
+            "follower_left_joint_2.pos",
+            "follower_left_joint_3.pos",
+            "follower_left_joint_4.pos",
+            "follower_left_joint_5.pos",
+            "follower_left_joint_6.pos",
+            "follower_l_thumb.pos",
+            "follower_l_thumb_aux.pos",
+            "follower_l_index.pos",
+            "follower_l_middle.pos",
+            "follower_l_ring.pos",
+            "follower_l_pinky.pos",
+            "follower_right_joint_0.pos",
+            "follower_right_joint_1.pos",
+            "follower_right_joint_2.pos",
+            "follower_right_joint_3.pos",
+            "follower_right_joint_4.pos",
+            "follower_right_joint_5.pos",
+            "follower_right_joint_6.pos",
+            "follower_r_thumb.pos",
+            "follower_r_thumb_aux.pos",
+            "follower_r_index.pos",
+            "follower_r_middle.pos",
+            "follower_r_ring.pos",
+            "follower_r_pinky.pos",
+            "follower_head_yaw.pos",
+            "follower_head_pitch.pos",
+        ]
+
+        goal_joint = []
+        for key in expected_action_keys:
+            val = action.get(key, 0.0)
+            if hasattr(val, "item"):
+                val = val.item()
+            goal_joint.append(float(val))
+        goal_joint_numpy = np.array(goal_joint, dtype=np.float32)
         try:
-            if goal_joint_numpy.shape != (16,):
-                raise ValueError(f"Action vector must be 16-dimensional, got {goal_joint_numpy.shape[0]}")
+            if goal_joint_numpy.shape != (28,):
+                raise ValueError(f"Action vector must be 28-dimensional, got {goal_joint_numpy.shape[0]}")
             
             # 调用ROS1节点的ros_replay方法发布动作（替换ROS2节点）
             self.robot_ros1_node.ros_replay(goal_joint_numpy)

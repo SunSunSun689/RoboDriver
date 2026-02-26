@@ -62,13 +62,13 @@ class LEJUKuavoRos1Config(RobotConfig):
 
     cameras: Dict[str, CameraConfig] = field(
         default_factory=lambda: {
-            "image_top": OpenCVCameraConfig(index_or_path=0, fps=30, width=848, height=480),
+            "image_top": OpenCVCameraConfig(index_or_path=0, fps=30, width=424, height=240),
             "image_wrist_left": OpenCVCameraConfig(index_or_path=1, fps=30, width=848, height=480),
             "image_wrist_right": OpenCVCameraConfig(index_or_path=2, fps=30, width=848, height=480),
         }
     )
 
-    use_videos: bool = False
+    use_videos: bool = True
 
     microphones: Dict[str, int] = field(default_factory=lambda: {}
     )
