@@ -15,6 +15,13 @@
 ## 快速启动
 
 ### 前置条件
+#### 激活can通信
+```bash
+# 查找can对应的USB port
+bash find_all_can_port.sh 
+激活can0
+bash can_activate.sh can0 1000000 USB-port  # bash can_activate.sh can0 1000000 3-8.4.4:1.0
+```
 
 ```bash
 # 1. 启动 CAN 总线
