@@ -102,13 +102,39 @@ cd /home/dora/RoboDriver/robodriver/teleoperators/robodriver-teleoperator-pico-u
 source .venv/bin/activate
 ```
 
-### 3. 启动 Dora 服务
+### 3.设置机械臂的Home位置
+
+使用 `scripts/read_joints.py` 脚本管理双臂的 Home 位置（右臂 `can0`，左臂 `can1`）。
+
+```bash
+# 持续刷新显示双臂关节状态（每 0.5s 一次，Ctrl+C 停止）
+python scripts/read_joints.py
+
+# 只读一次就退出
+python scripts/read_joints.py --once
+
+# 将当前位置保存为 home（写入 scripts/home_positions.json）
+python scripts/read_joints.py --set-home
+
+# 将双臂发送到已保存的 home 位置
+python scripts/read_joints.py --go-home
+```
+
+输出格式示例：
+```
+[RIGHT]  joints: +0.0123  -0.4567  +0.1234  -0.2345  +0.3456  -0.4567  gripper: 0.250
+[LEFT ]  joints: +0.0456  -0.3210  +0.1111  -0.2222  +0.3333  -0.4444  gripper: 0.100
+```
+
+**典型流程**：手动将双臂摆到合适的初始姿态 → `--set-home` 保存 → 每次启动前 `--go-home` 复位。
+
+### 4. 启动 Dora 服务
 
 ```bash
 dora up
 ```
 
-### 4. 启动数据流
+### 5. 启动数据流
 
 ```bash
 dora start dora/dataflow.yml
